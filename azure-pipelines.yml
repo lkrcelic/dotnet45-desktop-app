@@ -1,33 +1,94 @@
-# .NET Desktop
-# Build and run tests for .NET Desktop or Windows classic desktop solutions.
-# Add steps that publish symbols, save build artifacts, and more:
-# https://docs.microsoft.com/azure/devops/pipelines/apps/windows/dot-net
-
 trigger:
-- master
+  branches:
+    include:
+      - master
 
 pool:
   vmImage: 'windows-latest'
 
 variables:
   solution: '**/*.sln'
-  buildPlatform: 'Any CPU'
   buildConfiguration: 'Release'
+  buildPlatform: 'Any CPU'
+  refAssembliesVersion: '1.0.3'
+  refAssembliesDir: '$(Pipeline.Workspace)\refasm'
 
 steps:
+# 1. Ensure NuGet CLI is present
 - task: NuGetToolInstaller@1
+  displayName: 'Install NuGet CLI'
 
+# 2. Download ONLY the net45 reference assemblies from nuget.org.
+#    -ExcludeVersion keeps the extracted path stable (no version folder).
 - task: NuGetCommand@2
+  displayName: 'Download net45 reference assemblies'
   inputs:
+    command: 'custom'
+    arguments: >-
+      install Microsoft.NETFramework.ReferenceAssemblies.net45
+      -Version $(refAssembliesVersion)
+      -OutputDirectory $(refAssembliesDir)
+      -ExcludeVersion
+      -Source https://api.nuget.org/v3/index.json
+
+# 3. Make the v4.5 reference assemblies discoverable two ways:
+#    (a) FrameworkPathOverride via auto-imported Directory.Build.props (no source edit)
+#    (b) copy into the system Reference Assemblies path MSBuild probes by default
+- task: PowerShell@2
+  displayName: 'Provision v4.5 reference assemblies (no source changes)'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $refPath = Join-Path "$(refAssembliesDir)" "Microsoft.NETFramework.ReferenceAssemblies.net45\build\.NETFramework\v4.5"
+      if (-not (Test-Path $refPath)) {
+        Write-Error "Reference assembly path not found: $refPath"
+        Get-ChildItem "$(refAssembliesDir)" -Recurse -Directory | Select-Object FullName
+        exit 1
+      }
+      Write-Host "Found reference assemblies at: $refPath"
+
+      # (a) Inject FrameworkPathOverride at repo root. MSBuild auto-imports this,
+      #     so the client's .csproj never needs editing.
+      $props = @"
+      <Project>
+        <PropertyGroup>
+          <FrameworkPathOverride>$refPath</FrameworkPathOverride>
+        </PropertyGroup>
+      </Project>
+      "@
+      $target = Join-Path "$(Build.SourcesDirectory)" "Directory.Build.props"
+      Set-Content -Path $target -Value $props -Encoding UTF8
+      Write-Host "Wrote $target"
+
+      # (b) Fallback: copy into the path MSBuild's GetReferenceAssemblyPaths probes.
+      $sysRoot = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.5"
+      if (-not (Test-Path $sysRoot)) {
+        New-Item -ItemType Directory -Force -Path $sysRoot | Out-Null
+        Copy-Item -Path (Join-Path $refPath '*') -Destination $sysRoot -Recurse -Force
+        Write-Host "Copied reference assemblies into $sysRoot"
+      } else {
+        Write-Host "System path already present: $sysRoot"
+      }
+
+# 4. Restore the solution's own NuGet packages (packages.config or PackageReference)
+- task: NuGetCommand@2
+  displayName: 'Restore solution packages'
+  inputs:
+    command: 'restore'
     restoreSolution: '$(solution)'
 
+# 5. Build the solution, sending output to a clean staging folder
 - task: VSBuild@1
+  displayName: 'Build solution'
   inputs:
     solution: '$(solution)'
     platform: '$(buildPlatform)'
     configuration: '$(buildConfiguration)'
+    msbuildArgs: '/p:OutDir=$(Build.ArtifactStagingDirectory)\build'
 
-- task: VSTest@2
+# 6. Publish the .exe / .dll output as a downloadable pipeline artifact
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish binaries'
   inputs:
-    platform: '$(buildPlatform)'
-    configuration: '$(buildConfiguration)'
+    targetPath: '$(Build.ArtifactStagingDirectory)\build'
+    artifact: 'SalesPro'
