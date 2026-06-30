@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore packages
+        run: nuget restore Dotnet45DesktopApp.sln
+
+      - name: Build (Release)
+        run: msbuild Dotnet45DesktopApp.sln /p:Configuration=Release /p:Platform="Any CPU"
+
+      - name: Run headless self-test
+        run: .\Dotnet45DesktopApp\bin\Release\Dotnet45DesktopApp.exe --selftest
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dotnet45DesktopApp
+          path: Dotnet45DesktopApp/bin/Release/
