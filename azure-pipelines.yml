@@ -1,7 +1,5 @@
 trigger:
-  branches:
-    include:
-      - main
+  - main
 
 pool:
   vmImage: 'windows-latest'
@@ -9,104 +7,69 @@ pool:
 variables:
   solution: '**/*.sln'
   buildConfiguration: 'Release'
-  buildPlatform: 'Any CPU'
-  refAssembliesVersion: '1.0.3'
   refAssembliesDir: '$(Pipeline.Workspace)\refasm'
-
-  # Azure Artifacts settings
-  artifactFeed: 'NADEC/Sales-PRO'
-  universalPackageName: 'salespro'
-  universalPackageVersion: '1.0.$(Build.BuildId)'
+  feed: 'NADEC/NADEC'                       # project/feed
+  packageId: 'SalesPro'
+  packageVersion: '1.0.$(Build.BuildId)'
 
 steps:
-# ---- BUILD (unchanged from before — required for .NET 4.5) ----
-- task: NuGetToolInstaller@1
-  displayName: 'Install NuGet CLI'
-
+# --- .NET 4.5 reference assemblies (required, no source edits) ---
 - task: NuGetCommand@2
-  displayName: 'Download net45 reference assemblies'
+  displayName: 'Get net45 reference assemblies'
   inputs:
     command: 'custom'
-    arguments: >-
-      install Microsoft.NETFramework.ReferenceAssemblies.net45
-      -Version $(refAssembliesVersion)
-      -OutputDirectory $(refAssembliesDir)
-      -ExcludeVersion
-      -Source https://api.nuget.org/v3/index.json
+    arguments: 'install Microsoft.NETFramework.ReferenceAssemblies.net45 -Version 1.0.3 -OutputDirectory $(refAssembliesDir) -ExcludeVersion'
 
-- task: PowerShell@2
-  displayName: 'Provision v4.5 reference assemblies (no source changes)'
-  inputs:
-    targetType: 'inline'
-    script: |
-      $refPath = Join-Path "$(refAssembliesDir)" "Microsoft.NETFramework.ReferenceAssemblies.net45\build\.NETFramework\v4.5"
-      if (-not (Test-Path $refPath)) {
-        Write-Error "Reference assembly path not found: $refPath"
-        Get-ChildItem "$(refAssembliesDir)" -Recurse -Directory | Select-Object FullName
-        exit 1
-      }
-      $props = @"
-      <Project>
-        <PropertyGroup>
-          <FrameworkPathOverride>$refPath</FrameworkPathOverride>
-        </PropertyGroup>
-      </Project>
-      "@
-      Set-Content -Path (Join-Path "$(Build.SourcesDirectory)" "Directory.Build.props") -Value $props -Encoding UTF8
-      $sysRoot = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.5"
-      if (-not (Test-Path $sysRoot)) {
-        New-Item -ItemType Directory -Force -Path $sysRoot | Out-Null
-        Copy-Item -Path (Join-Path $refPath '*') -Destination $sysRoot -Recurse -Force
-      }
+- powershell: |
+    $r = "$(refAssembliesDir)\Microsoft.NETFramework.ReferenceAssemblies.net45\build\.NETFramework\v4.5"
+    "<Project><PropertyGroup><FrameworkPathOverride>$r</FrameworkPathOverride></PropertyGroup></Project>" |
+      Set-Content "$(Build.SourcesDirectory)\Directory.Build.props"
+  displayName: 'Point MSBuild at net45'
 
+# --- Build ---
 - task: NuGetCommand@2
-  displayName: 'Restore solution packages'
+  displayName: 'Restore'
   inputs:
-    command: 'restore'
     restoreSolution: '$(solution)'
 
 - task: VSBuild@1
-  displayName: 'Build solution'
+  displayName: 'Build'
   inputs:
     solution: '$(solution)'
-    platform: '$(buildPlatform)'
     configuration: '$(buildConfiguration)'
-    msbuildArgs: '/p:OutDir=$(Build.ArtifactStagingDirectory)\publish'
+    msbuildArgs: '/p:OutDir=$(Build.ArtifactStagingDirectory)\out'
 
-# ---- PUBLISH (new — mirrors your working example) ----
-- task: ArchiveFiles@2
-  displayName: 'Create artifact ZIP (.exe / .dll)'
-  inputs:
-    rootFolderOrFile: '$(Build.ArtifactStagingDirectory)\publish'
-    includeRootFolder: false
-    archiveType: 'zip'
-    archiveFile: '$(Build.ArtifactStagingDirectory)\$(universalPackageName).zip'
-    replaceExistingArchive: true
+# --- Wrap .exe/.dll into a .nupkg ---
+- powershell: |
+    $nuspec = @"
+    <?xml version="1.0"?>
+    <package>
+      <metadata>
+        <id>$(packageId)</id>
+        <version>$(packageVersion)</version>
+        <authors>CROZ</authors>
+        <description>SalesPro .NET 4.5 build $(Build.BuildNumber)</description>
+      </metadata>
+      <files>
+        <file src="$(Build.ArtifactStagingDirectory)\out\**" target="lib" />
+      </files>
+    </package>
+    "@
+    Set-Content -Path "$(Build.ArtifactStagingDirectory)\SalesPro.nuspec" -Value $nuspec -Encoding UTF8
+  displayName: 'Generate nuspec'
 
-- task: PublishPipelineArtifact@1
-  displayName: 'Upload pipeline artifact'
+- task: NuGetCommand@2
+  displayName: 'Pack'
   inputs:
-    targetPath: '$(Build.ArtifactStagingDirectory)\$(universalPackageName).zip'
-    artifact: 'drop'
+    command: 'pack'
+    packagesToPack: '$(Build.ArtifactStagingDirectory)\SalesPro.nuspec'
+    packDestination: '$(Build.ArtifactStagingDirectory)\nupkg'
 
-- task: CopyFiles@2
-  displayName: 'Prepare Azure Artifacts package'
+# --- Push to NADEC feed ---
+- task: NuGetCommand@2
+  displayName: 'Push to NADEC feed'
   inputs:
-    SourceFolder: '$(Build.ArtifactStagingDirectory)'
-    Contents: '$(universalPackageName).zip'
-    TargetFolder: '$(Build.ArtifactStagingDirectory)\universal-package'
-    CleanTargetFolder: true
-
-- task: UniversalPackages@0
-  displayName: 'Publish package to Azure Artifacts'
-  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-  inputs:
-    command: 'publish'
-    feedsToUsePublish: 'internal'
-    publishDirectory: '$(Build.ArtifactStagingDirectory)\universal-package'
-    vstsFeedPublish: '$(artifactFeed)'
-    vstsFeedPackagePublish: '$(universalPackageName)'
-    versionOption: 'custom'
-    versionPublish: '$(universalPackageVersion)'
-    packagePublishDescription: '.NET 4.5 build $(Build.BuildNumber)'
-    publishPackageMetadata: true
+    command: 'push'
+    packagesToPush: '$(Build.ArtifactStagingDirectory)\nupkg\*.nupkg'
+    nuGetFeedType: 'internal'
+    publishVstsFeed: '$(feed)'
