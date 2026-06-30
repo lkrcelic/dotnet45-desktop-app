@@ -1,7 +1,7 @@
 trigger:
   branches:
     include:
-      - master
+      - main
 
 pool:
   vmImage: 'windows-latest'
@@ -13,13 +13,16 @@ variables:
   refAssembliesVersion: '1.0.3'
   refAssembliesDir: '$(Pipeline.Workspace)\refasm'
 
+  # Azure Artifacts settings
+  artifactFeed: 'NADEC/Sales-PRO'
+  universalPackageName: 'salespro'
+  universalPackageVersion: '1.0.$(Build.BuildId)'
+
 steps:
-# 1. Ensure NuGet CLI is present
+# ---- BUILD (unchanged from before — required for .NET 4.5) ----
 - task: NuGetToolInstaller@1
   displayName: 'Install NuGet CLI'
 
-# 2. Download ONLY the net45 reference assemblies from nuget.org.
-#    -ExcludeVersion keeps the extracted path stable (no version folder).
 - task: NuGetCommand@2
   displayName: 'Download net45 reference assemblies'
   inputs:
@@ -31,9 +34,6 @@ steps:
       -ExcludeVersion
       -Source https://api.nuget.org/v3/index.json
 
-# 3. Make the v4.5 reference assemblies discoverable two ways:
-#    (a) FrameworkPathOverride via auto-imported Directory.Build.props (no source edit)
-#    (b) copy into the system Reference Assemblies path MSBuild probes by default
 - task: PowerShell@2
   displayName: 'Provision v4.5 reference assemblies (no source changes)'
   inputs:
@@ -45,10 +45,6 @@ steps:
         Get-ChildItem "$(refAssembliesDir)" -Recurse -Directory | Select-Object FullName
         exit 1
       }
-      Write-Host "Found reference assemblies at: $refPath"
-
-      # (a) Inject FrameworkPathOverride at repo root. MSBuild auto-imports this,
-      #     so the client's .csproj never needs editing.
       $props = @"
       <Project>
         <PropertyGroup>
@@ -56,39 +52,61 @@ steps:
         </PropertyGroup>
       </Project>
       "@
-      $target = Join-Path "$(Build.SourcesDirectory)" "Directory.Build.props"
-      Set-Content -Path $target -Value $props -Encoding UTF8
-      Write-Host "Wrote $target"
-
-      # (b) Fallback: copy into the path MSBuild's GetReferenceAssemblyPaths probes.
+      Set-Content -Path (Join-Path "$(Build.SourcesDirectory)" "Directory.Build.props") -Value $props -Encoding UTF8
       $sysRoot = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.5"
       if (-not (Test-Path $sysRoot)) {
         New-Item -ItemType Directory -Force -Path $sysRoot | Out-Null
         Copy-Item -Path (Join-Path $refPath '*') -Destination $sysRoot -Recurse -Force
-        Write-Host "Copied reference assemblies into $sysRoot"
-      } else {
-        Write-Host "System path already present: $sysRoot"
       }
 
-# 4. Restore the solution's own NuGet packages (packages.config or PackageReference)
 - task: NuGetCommand@2
   displayName: 'Restore solution packages'
   inputs:
     command: 'restore'
     restoreSolution: '$(solution)'
 
-# 5. Build the solution, sending output to a clean staging folder
 - task: VSBuild@1
   displayName: 'Build solution'
   inputs:
     solution: '$(solution)'
     platform: '$(buildPlatform)'
     configuration: '$(buildConfiguration)'
-    msbuildArgs: '/p:OutDir=$(Build.ArtifactStagingDirectory)\build'
+    msbuildArgs: '/p:OutDir=$(Build.ArtifactStagingDirectory)\publish'
 
-# 6. Publish the .exe / .dll output as a downloadable pipeline artifact
-- task: PublishPipelineArtifact@1
-  displayName: 'Publish binaries'
+# ---- PUBLISH (new — mirrors your working example) ----
+- task: ArchiveFiles@2
+  displayName: 'Create artifact ZIP (.exe / .dll)'
   inputs:
-    targetPath: '$(Build.ArtifactStagingDirectory)\build'
-    artifact: 'SalesPro'
+    rootFolderOrFile: '$(Build.ArtifactStagingDirectory)\publish'
+    includeRootFolder: false
+    archiveType: 'zip'
+    archiveFile: '$(Build.ArtifactStagingDirectory)\$(universalPackageName).zip'
+    replaceExistingArchive: true
+
+- task: PublishPipelineArtifact@1
+  displayName: 'Upload pipeline artifact'
+  inputs:
+    targetPath: '$(Build.ArtifactStagingDirectory)\$(universalPackageName).zip'
+    artifact: 'drop'
+
+- task: CopyFiles@2
+  displayName: 'Prepare Azure Artifacts package'
+  inputs:
+    SourceFolder: '$(Build.ArtifactStagingDirectory)'
+    Contents: '$(universalPackageName).zip'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)\universal-package'
+    CleanTargetFolder: true
+
+- task: UniversalPackages@0
+  displayName: 'Publish package to Azure Artifacts'
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  inputs:
+    command: 'publish'
+    feedsToUsePublish: 'internal'
+    publishDirectory: '$(Build.ArtifactStagingDirectory)\universal-package'
+    vstsFeedPublish: '$(artifactFeed)'
+    vstsFeedPackagePublish: '$(universalPackageName)'
+    versionOption: 'custom'
+    versionPublish: '$(universalPackageVersion)'
+    packagePublishDescription: '.NET 4.5 build $(Build.BuildNumber)'
+    publishPackageMetadata: true
